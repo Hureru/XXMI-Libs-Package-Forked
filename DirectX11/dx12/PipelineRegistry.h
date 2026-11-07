@@ -3,6 +3,8 @@
 #include <string>
 #include <vector>
 
+#include <d3d11.h>
+
 #include "Dx12Common.h"
 
 // What a pipeline state or root signature was created from cannot be read
@@ -200,6 +202,31 @@ void Dx12RegisterPipeline(void **ppPipelineState, const D3D12_COMPUTE_PIPELINE_S
 void Dx12RegisterPipeline(void **ppPipelineState, const D3D12_PIPELINE_STATE_STREAM_DESC *desc);
 
 const Dx12PipelineInfo* Dx12FindPipeline(ID3D12PipelineState *pipeline);
+
+// What a [CustomShader] section sets of the fixed-function state, in the D3D11
+// terms it was given in, for the draws its command lists make in a draw of the
+// game: those are made with the game's pipeline state, which this goes into
+// (Dx12PipelineVariant). The masks say what of each description is the
+// section's: a byte of 0 is, one of 0xff is left as the game has it. That is
+// all 0xff for a part the section does not set, all 0 for one it sets in full
+// (replacing what is set, as on a D3D11 context) and, with *_state_merge = 1,
+// the masks CustomShader merges with under D3D11.
+struct Dx12CustomStates {
+	D3D11_BLEND_DESC blend, blend_mask;
+	UINT sample_mask, sample_mask_mask;
+	D3D11_DEPTH_STENCIL_DESC depth_stencil, depth_stencil_mask;
+	D3D11_RASTERIZER_DESC rasterizer, rasterizer_mask;
+	// What is set on the list rather than in the pipeline state: a bit of 1
+	// in stencil_ref_mask, and a blend_factor_game of true, is the game's
+	UINT stencil_ref, stencil_ref_mask;
+	FLOAT blend_factor[4];
+	bool blend_factor_game[4];
+	// Of the part that goes into the pipeline state, by
+	// Dx12CustomStatesKey: 0 if that leaves all of it to the game
+	UINT64 key;
+};
+void Dx12CustomStatesKey(Dx12CustomStates *states);
+
 // What a pipeline of the game is made again with. Where nothing is given the
 // game's is kept.
 struct Dx12PipelineVariantDesc {
@@ -214,6 +241,9 @@ struct Dx12PipelineVariantDesc {
 	// In place of the game's root signature, for registers of the mod's
 	// shaders the game's has nothing for (Dx12ExtendRootSignature)
 	ID3D12RootSignature *root_signature;
+	// Fixed-function state of a [CustomShader] section, with a key that is
+	// not 0. NULL for the game's.
+	const Dx12CustomStates *states;
 };
 
 // The game's pipeline made again with that. Not referenced: it lives as long

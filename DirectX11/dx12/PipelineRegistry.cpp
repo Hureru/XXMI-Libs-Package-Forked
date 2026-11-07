@@ -994,6 +994,297 @@ static const char* stage_list(UINT stages, char *text, size_t size)
 	return text;
 }
 
+// -----------------------------------------------------------------------------
+// The fixed-function state of a [CustomShader] section in a pipeline of the
+// game. The section has it as D3D11 descriptions, with a byte of 0 in a mask
+// for each byte of them that it sets. The enumerations of D3D11 and D3D12 have
+// the same values. What D3D12 has and D3D11 does not (logic operations,
+// conservative rasterization, depth bounds, ...) stays as the game has it, and
+// so does what D3D11 has and D3D12 does not (ScissorEnable: D3D12 always
+// scissors).
+
+static bool all_ones(const void *mask, size_t size)
+{
+	const BYTE *bytes = (const BYTE*)mask;
+	size_t i;
+
+	for (i = 0; i < size; i++) {
+		if (bytes[i] != 0xff)
+			return false;
+	}
+	return true;
+}
+
+// Whether the section sets a field
+#define SECTION_SETS(mask, field) (!all_ones(&(mask).field, sizeof((mask).field)))
+
+void Dx12CustomStatesKey(Dx12CustomStates *states)
+{
+	// The section's bytes alone: the others may hold anything, as merging
+	// copies them from a description of what was set before. Copied byte for
+	// byte, padding and all, for the key to be the same every time.
+	struct {
+		D3D11_BLEND_DESC blend, blend_mask;
+		UINT sample_mask, sample_mask_mask;
+		D3D11_DEPTH_STENCIL_DESC depth_stencil, depth_stencil_mask;
+		D3D11_RASTERIZER_DESC rasterizer, rasterizer_mask;
+	} parts;
+	struct Part {
+		BYTE *value;
+		const BYTE *mask;
+		size_t size;
+	};
+	bool any = false;
+	size_t i;
+
+	memset(&parts, 0, sizeof(parts));
+	memcpy(&parts.blend, &states->blend, sizeof(parts.blend));
+	memcpy(&parts.blend_mask, &states->blend_mask, sizeof(parts.blend_mask));
+	parts.sample_mask = states->sample_mask;
+	parts.sample_mask_mask = states->sample_mask_mask;
+	memcpy(&parts.depth_stencil, &states->depth_stencil, sizeof(parts.depth_stencil));
+	memcpy(&parts.depth_stencil_mask, &states->depth_stencil_mask, sizeof(parts.depth_stencil_mask));
+	memcpy(&parts.rasterizer, &states->rasterizer, sizeof(parts.rasterizer));
+	memcpy(&parts.rasterizer_mask, &states->rasterizer_mask, sizeof(parts.rasterizer_mask));
+
+	const Part list[] = {
+		{ (BYTE*)&parts.blend, (const BYTE*)&parts.blend_mask, sizeof(parts.blend) },
+		{ (BYTE*)&parts.sample_mask, (const BYTE*)&parts.sample_mask_mask, sizeof(parts.sample_mask) },
+		{ (BYTE*)&parts.depth_stencil, (const BYTE*)&parts.depth_stencil_mask, sizeof(parts.depth_stencil) },
+		{ (BYTE*)&parts.rasterizer, (const BYTE*)&parts.rasterizer_mask, sizeof(parts.rasterizer) },
+	};
+	for (const Part &part : list) {
+		for (i = 0; i < part.size; i++)
+			part.value[i] = (BYTE)(part.value[i] & ~part.mask[i]);
+		any |= !all_ones(part.mask, part.size);
+	}
+	states->key = any ? fnv_64_buf(&parts, sizeof(parts)) | 1 : 0;
+}
+
+static void apply_blend(D3D12_BLEND_DESC *desc, const Dx12CustomStates *states)
+{
+	const D3D11_BLEND_DESC &set = states->blend, &mask = states->blend_mask;
+	UINT i;
+
+	// What the game blended all targets with, RenderTarget[0], stands for
+	// those the section leaves to the game once each has its own
+	if (SECTION_SETS(mask, IndependentBlendEnable) && set.IndependentBlendEnable && !desc->IndependentBlendEnable) {
+		for (i = 1; i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
+			desc->RenderTarget[i] = desc->RenderTarget[0];
+	}
+	if (SECTION_SETS(mask, AlphaToCoverageEnable))
+		desc->AlphaToCoverageEnable = set.AlphaToCoverageEnable;
+	if (SECTION_SETS(mask, IndependentBlendEnable))
+		desc->IndependentBlendEnable = set.IndependentBlendEnable;
+
+	for (i = 0; i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; i++) {
+		const D3D11_RENDER_TARGET_BLEND_DESC &rt = set.RenderTarget[i], &rt_mask = mask.RenderTarget[i];
+		D3D12_RENDER_TARGET_BLEND_DESC *target = &desc->RenderTarget[i];
+		bool game_blends = !!target->BlendEnable;
+		bool factors_set = SECTION_SETS(rt_mask, SrcBlend) || SECTION_SETS(rt_mask, DestBlend) || SECTION_SETS(rt_mask, BlendOp)
+			|| SECTION_SETS(rt_mask, SrcBlendAlpha) || SECTION_SETS(rt_mask, DestBlendAlpha) || SECTION_SETS(rt_mask, BlendOpAlpha);
+
+		if (SECTION_SETS(rt_mask, BlendEnable))
+			target->BlendEnable = rt.BlendEnable;
+		if (SECTION_SETS(rt_mask, SrcBlend))
+			target->SrcBlend = (D3D12_BLEND)rt.SrcBlend;
+		if (SECTION_SETS(rt_mask, DestBlend))
+			target->DestBlend = (D3D12_BLEND)rt.DestBlend;
+		if (SECTION_SETS(rt_mask, BlendOp))
+			target->BlendOp = (D3D12_BLEND_OP)rt.BlendOp;
+		if (SECTION_SETS(rt_mask, SrcBlendAlpha))
+			target->SrcBlendAlpha = (D3D12_BLEND)rt.SrcBlendAlpha;
+		if (SECTION_SETS(rt_mask, DestBlendAlpha))
+			target->DestBlendAlpha = (D3D12_BLEND)rt.DestBlendAlpha;
+		if (SECTION_SETS(rt_mask, BlendOpAlpha))
+			target->BlendOpAlpha = (D3D12_BLEND_OP)rt.BlendOpAlpha;
+		if (SECTION_SETS(rt_mask, RenderTargetWriteMask))
+			target->RenderTargetWriteMask = rt.RenderTargetWriteMask;
+
+		// A section that gives a write mask turns blending on with factors
+		// that leave the colour as it is, which is no blending: not on a
+		// target the game does not blend, whatever factors it left there,
+		// and not with those factors, which a target of a format that
+		// cannot be blended takes only without blending
+		if (target->BlendEnable && !game_blends && !factors_set)
+			target->BlendEnable = FALSE;
+		if (target->BlendEnable && target->SrcBlend == D3D12_BLEND_ONE && target->DestBlend == D3D12_BLEND_ZERO
+		    && target->BlendOp == D3D12_BLEND_OP_ADD && target->SrcBlendAlpha == D3D12_BLEND_ONE
+		    && target->DestBlendAlpha == D3D12_BLEND_ZERO && target->BlendOpAlpha == D3D12_BLEND_OP_ADD)
+			target->BlendEnable = FALSE;
+		// D3D12 takes either blending or a logic operation
+		if (target->BlendEnable)
+			target->LogicOpEnable = FALSE;
+	}
+}
+
+static void apply_sample_mask(UINT *sample_mask, const Dx12CustomStates *states)
+{
+	*sample_mask = *sample_mask & states->sample_mask_mask | states->sample_mask & ~states->sample_mask_mask;
+}
+
+static void apply_stencil_op(D3D12_DEPTH_STENCILOP_DESC *op, const D3D11_DEPTH_STENCILOP_DESC &set, const D3D11_DEPTH_STENCILOP_DESC &mask)
+{
+	if (SECTION_SETS(mask, StencilFailOp))
+		op->StencilFailOp = (D3D12_STENCIL_OP)set.StencilFailOp;
+	if (SECTION_SETS(mask, StencilDepthFailOp))
+		op->StencilDepthFailOp = (D3D12_STENCIL_OP)set.StencilDepthFailOp;
+	if (SECTION_SETS(mask, StencilPassOp))
+		op->StencilPassOp = (D3D12_STENCIL_OP)set.StencilPassOp;
+	if (SECTION_SETS(mask, StencilFunc))
+		op->StencilFunc = (D3D12_COMPARISON_FUNC)set.StencilFunc;
+}
+
+static void apply_stencil_op1(D3D12_DEPTH_STENCILOP_DESC1 *op, const D3D11_DEPTH_STENCILOP_DESC &set, const D3D11_DEPTH_STENCILOP_DESC &mask,
+		const Dx12CustomStates *states)
+{
+	if (SECTION_SETS(mask, StencilFailOp))
+		op->StencilFailOp = (D3D12_STENCIL_OP)set.StencilFailOp;
+	if (SECTION_SETS(mask, StencilDepthFailOp))
+		op->StencilDepthFailOp = (D3D12_STENCIL_OP)set.StencilDepthFailOp;
+	if (SECTION_SETS(mask, StencilPassOp))
+		op->StencilPassOp = (D3D12_STENCIL_OP)set.StencilPassOp;
+	if (SECTION_SETS(mask, StencilFunc))
+		op->StencilFunc = (D3D12_COMPARISON_FUNC)set.StencilFunc;
+	// D3D11 has one read and one write mask for both faces
+	if (SECTION_SETS(states->depth_stencil_mask, StencilReadMask))
+		op->StencilReadMask = states->depth_stencil.StencilReadMask;
+	if (SECTION_SETS(states->depth_stencil_mask, StencilWriteMask))
+		op->StencilWriteMask = states->depth_stencil.StencilWriteMask;
+}
+
+// D3D12_DEPTH_STENCIL_DESC and D3D12_DEPTH_STENCIL_DESC1, which only adds
+// depth bounds
+template <class Desc>
+static void apply_depth_stencil(Desc *desc, const Dx12CustomStates *states)
+{
+	const D3D11_DEPTH_STENCIL_DESC &set = states->depth_stencil, &mask = states->depth_stencil_mask;
+
+	if (SECTION_SETS(mask, DepthEnable))
+		desc->DepthEnable = set.DepthEnable;
+	if (SECTION_SETS(mask, DepthWriteMask))
+		desc->DepthWriteMask = (D3D12_DEPTH_WRITE_MASK)set.DepthWriteMask;
+	if (SECTION_SETS(mask, DepthFunc))
+		desc->DepthFunc = (D3D12_COMPARISON_FUNC)set.DepthFunc;
+	if (SECTION_SETS(mask, StencilEnable))
+		desc->StencilEnable = set.StencilEnable;
+	if (SECTION_SETS(mask, StencilReadMask))
+		desc->StencilReadMask = set.StencilReadMask;
+	if (SECTION_SETS(mask, StencilWriteMask))
+		desc->StencilWriteMask = set.StencilWriteMask;
+	apply_stencil_op(&desc->FrontFace, set.FrontFace, mask.FrontFace);
+	apply_stencil_op(&desc->BackFace, set.BackFace, mask.BackFace);
+}
+
+static void apply_depth_stencil2(D3D12_DEPTH_STENCIL_DESC2 *desc, const Dx12CustomStates *states)
+{
+	const D3D11_DEPTH_STENCIL_DESC &set = states->depth_stencil, &mask = states->depth_stencil_mask;
+
+	if (SECTION_SETS(mask, DepthEnable))
+		desc->DepthEnable = set.DepthEnable;
+	if (SECTION_SETS(mask, DepthWriteMask))
+		desc->DepthWriteMask = (D3D12_DEPTH_WRITE_MASK)set.DepthWriteMask;
+	if (SECTION_SETS(mask, DepthFunc))
+		desc->DepthFunc = (D3D12_COMPARISON_FUNC)set.DepthFunc;
+	if (SECTION_SETS(mask, StencilEnable))
+		desc->StencilEnable = set.StencilEnable;
+	apply_stencil_op1(&desc->FrontFace, set.FrontFace, mask.FrontFace, states);
+	apply_stencil_op1(&desc->BackFace, set.BackFace, mask.BackFace, states);
+}
+
+// What all of D3D12_RASTERIZER_DESC, DESC1 and DESC2 have alike. The depth
+// bias is an integer in the first and a float in the others.
+template <class Desc>
+static void apply_rasterizer_common(Desc *desc, const Dx12CustomStates *states)
+{
+	const D3D11_RASTERIZER_DESC &set = states->rasterizer, &mask = states->rasterizer_mask;
+
+	if (SECTION_SETS(mask, FillMode))
+		desc->FillMode = (D3D12_FILL_MODE)set.FillMode;
+	if (SECTION_SETS(mask, CullMode))
+		desc->CullMode = (D3D12_CULL_MODE)set.CullMode;
+	if (SECTION_SETS(mask, FrontCounterClockwise))
+		desc->FrontCounterClockwise = set.FrontCounterClockwise;
+	if (SECTION_SETS(mask, DepthBias))
+		desc->DepthBias = (decltype(desc->DepthBias))set.DepthBias;
+	if (SECTION_SETS(mask, DepthBiasClamp))
+		desc->DepthBiasClamp = set.DepthBiasClamp;
+	if (SECTION_SETS(mask, SlopeScaledDepthBias))
+		desc->SlopeScaledDepthBias = set.SlopeScaledDepthBias;
+	if (SECTION_SETS(mask, DepthClipEnable))
+		desc->DepthClipEnable = set.DepthClipEnable;
+}
+
+template <class Desc>
+static void apply_rasterizer(Desc *desc, const Dx12CustomStates *states)
+{
+	const D3D11_RASTERIZER_DESC &set = states->rasterizer, &mask = states->rasterizer_mask;
+
+	apply_rasterizer_common(desc, states);
+	if (SECTION_SETS(mask, MultisampleEnable))
+		desc->MultisampleEnable = set.MultisampleEnable;
+	if (SECTION_SETS(mask, AntialiasedLineEnable))
+		desc->AntialiasedLineEnable = set.AntialiasedLineEnable;
+}
+
+// What of a pipeline state a section can set
+enum CustomStatePart {
+	CUSTOM_STATE_BLEND = 1,
+	CUSTOM_STATE_SAMPLE_MASK = 2,
+	CUSTOM_STATE_DEPTH_STENCIL = 4,
+	CUSTOM_STATE_RASTERIZER = 8,
+};
+
+static UINT parts_set(const Dx12CustomStates *states)
+{
+	UINT parts = 0;
+
+	if (!all_ones(&states->blend_mask, sizeof(states->blend_mask)))
+		parts |= CUSTOM_STATE_BLEND;
+	if (states->sample_mask_mask != 0xffffffff)
+		parts |= CUSTOM_STATE_SAMPLE_MASK;
+	if (!all_ones(&states->depth_stencil_mask, sizeof(states->depth_stencil_mask)))
+		parts |= CUSTOM_STATE_DEPTH_STENCIL;
+	if (!all_ones(&states->rasterizer_mask, sizeof(states->rasterizer_mask)))
+		parts |= CUSTOM_STATE_RASTERIZER;
+	return parts;
+}
+
+// For a subobject of a stream: the part it is of, after setting that in it.
+// 0 for a subobject of anything else.
+static UINT apply_states_subobject(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type, BYTE *value, const Dx12CustomStates *states)
+{
+	switch (type) {
+	case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND:
+		apply_blend((D3D12_BLEND_DESC*)value, states);
+		return CUSTOM_STATE_BLEND;
+	case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK:
+		apply_sample_mask((UINT*)value, states);
+		return CUSTOM_STATE_SAMPLE_MASK;
+	case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL:
+		apply_depth_stencil((D3D12_DEPTH_STENCIL_DESC*)value, states);
+		return CUSTOM_STATE_DEPTH_STENCIL;
+	case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1:
+		apply_depth_stencil((D3D12_DEPTH_STENCIL_DESC1*)value, states);
+		return CUSTOM_STATE_DEPTH_STENCIL;
+	case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2:
+		apply_depth_stencil2((D3D12_DEPTH_STENCIL_DESC2*)value, states);
+		return CUSTOM_STATE_DEPTH_STENCIL;
+	case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER:
+		apply_rasterizer((D3D12_RASTERIZER_DESC*)value, states);
+		return CUSTOM_STATE_RASTERIZER;
+	case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1:
+		apply_rasterizer((D3D12_RASTERIZER_DESC1*)value, states);
+		return CUSTOM_STATE_RASTERIZER;
+	case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2:
+		apply_rasterizer_common((D3D12_RASTERIZER_DESC2*)value, states);
+		return CUSTOM_STATE_RASTERIZER;
+	}
+	return 0;
+}
+
+#undef SECTION_SETS
+
 ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Device *device, const Dx12PipelineVariantDesc *variant,
 		const char **why_failed)
 {
@@ -1009,7 +1300,7 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 	const Dx12ShaderInfo *shaders[DX12_STAGE_COUNT];
 	const char *failed = NULL;
 	UINT64 key = variant->layout_hash;
-	UINT mod_stages = 0, changed_stages, patched = 0;
+	UINT mod_stages = 0, changed_stages, patched = 0, states_patched = 0;
 	Dx12ShaderStage stage;
 	char stages[32];
 	size_t pos, size;
@@ -1024,6 +1315,7 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 	}
 	key = key * 0x9e3779b97f4a7c15ull ^ variant->removed_stages;
 	key = key * 0x9e3779b97f4a7c15ull ^ (UINT64)(uintptr_t)variant->root_signature;
+	key = key * 0x9e3779b97f4a7c15ull ^ (variant->states ? variant->states->key : 0);
 	changed_stages = mod_stages | variant->removed_stages;
 
 	for (const auto &made : info->variants) {
@@ -1063,6 +1355,12 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 		desc->InputLayout.pInputElementDescs = elements;
 		desc->InputLayout.NumElements = count;
 		desc->CachedPSO = {};
+		if (variant->states) {
+			apply_blend(&desc->BlendState, variant->states);
+			apply_sample_mask(&desc->SampleMask, variant->states);
+			apply_depth_stencil(&desc->DepthStencilState, variant->states);
+			apply_rasterizer(&desc->RasterizerState, variant->states);
+		}
 		if (!failed) {
 			Profiling::Spike::Scope spike(Profiling::Spike::DX12_MOD_PIPELINE, L"a pipeline of the game with a mod's input layout");
 			hr = device->CreateGraphicsPipelineState(desc, IID_PPV_ARGS(&pipeline));
@@ -1097,12 +1395,18 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 			} else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING) {
 				if (((D3D12_VIEW_INSTANCING_DESC*)value)->ViewInstanceCount)
 					failed = "it has view instancing";
+			} else if (variant->states) {
+				states_patched |= apply_states_subobject(type, value, variant->states);
 			}
 		}
 		// A subobject is not made up for a stage the game's stream has
 		// none for: the stream would have to be put together again
 		if (!failed && (mod_stages & ~patched))
 			failed = "the game's pipeline state stream has no subobject for a shader of the mod's";
+		// Nor for fixed-function state, which D3D12 would have defaults for
+		// that are not to be guessed
+		if (!failed && variant->states && (parts_set(variant->states) & ~states_patched))
+			failed = "the game's pipeline state stream has no subobject for fixed-function state the mod sets";
 		if (!failed && variant->root_signature && !has_signature)
 			failed = "the game's pipeline state stream has no root signature to extend";
 		if (!failed && FAILED(device->QueryInterface(IID_PPV_ARGS(&device2))))
@@ -1119,7 +1423,15 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 
 	if (!pipeline && reported < 16) {
 		reported++;
-		if (!changed_stages && failed)
+		if (!changed_stages && !variant->elements && variant->states && failed)
+			Dx12DumpNote("*** The fixed-function state a mod's [CustomShader] sets cannot be given to a pipeline of the game: %s. The game's is used."
+				" (%zu bytes kept, %s, stream of %u bytes read to %u, stopped at subobject %u)\n", failed,
+				info->creation.size(), info->creation_stream ? "a stream" : "a description",
+				info->stream_bytes, info->stream_read, info->stream_stopped_at);
+		else if (!changed_stages && !variant->elements && variant->states)
+			Dx12DumpNote("*** Creating a pipeline of the game again with the fixed-function state a mod's [CustomShader] sets failed: 0x%x."
+				" The game's is used.\n", hr);
+		else if (!changed_stages && failed)
 			Dx12DumpNote("*** A mod's input layout cannot be given to a pipeline of the game: %s. The game's layout is used."
 				" (%zu bytes kept, %s, shaders %s, stream of %u bytes read to %u, stopped at subobject %u)\n", failed,
 				info->creation.size(), info->creation_stream ? "a stream" : "a description",

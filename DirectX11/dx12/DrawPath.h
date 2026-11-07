@@ -4,6 +4,8 @@
 
 #include "Dx12CommandList.h"
 
+class CommandList;
+
 // What HackerContext does around every Draw and Dispatch of a D3D11 game, for
 // the draws and dispatches a D3D12 game records: run the [ShaderOverride]
 // sections of the shaders in use, with everything those can do from there.
@@ -164,6 +166,17 @@ ID3D11UnorderedAccessView* Dx12ScopeUnorderedAccess(UINT slot);
 // there is nothing a mod could write.
 ID3D11UnorderedAccessView* Dx12ScopeWrittenBuffer(UINT slot);
 void Dx12ScopeDraw(bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance);
+// What a [CustomShader] section sets of the fixed-function state, for the
+// draws its command lists make in a draw of the game (see Dx12CustomStates),
+// set by RunCustomShaderCommand for the time those run. Gives back what was set
+// before, to be set again afterwards. NULL for none.
+const Dx12CustomStates* Dx12ScopeSetCustomStates(const Dx12CustomStates *states);
+// wrap_draws: for the rest of the draw of the game, every draw made in it, the
+// game's own and those of mods, is made by running pre and then post (the
+// lists of an explicit command list section) in its place, where
+// draw = from_caller makes that draw. Not the draws those make themselves.
+// NULL for both makes the draws as they come again.
+void Dx12ScopeWrapDraws(CommandList *pre, CommandList *post);
 void Dx12ScopeUnsupported(const char *what);
 // For a ps-s0 = ... line of a mod, which only does something on D3D11 so far
 void Dx12SamplerBindingIgnored(const wchar_t *ini_line);

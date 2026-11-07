@@ -1019,6 +1019,33 @@ bail:
 	return false;
 }
 
+// wrap_draws = CommandListFoo, or null
+static bool ParseWrapDraws(const wchar_t *section,
+		const wchar_t *key, wstring *val,
+		CommandList *explicit_command_list,
+		CommandList *pre_command_list,
+		CommandList *post_command_list,
+		const wstring *ini_namespace)
+{
+	WrapDrawsCommand *operation = new WrapDrawsCommand();
+
+	if (wcscmp(val->c_str(), L"null")) {
+		if (wcsncmp(val->c_str(), L"commandlist", 11))
+			goto bail;
+		operation->section = FindExplicitCommandListSection(val->c_str(), ini_namespace);
+		if (!operation->section)
+			goto bail;
+	}
+
+	// Like handling = skip it is for the draws that come after it, so it
+	// goes with the pre command list unless told otherwise
+	return AddCommandToList(operation, explicit_command_list, pre_command_list, NULL, NULL, section, key, val);
+
+bail:
+	delete operation;
+	return false;
+}
+
 bool ParseCopyCommandListCommand(const wchar_t* section,
 	const wchar_t* key, wstring* val,
 	CommandList* explicit_command_list,
@@ -1385,6 +1412,9 @@ bool ParseCommandListGeneralCommands(const wchar_t *section,
 
 	if (!wcscmp(key, L"reset_per_frame_limits"))
 		return ParseResetPerFrameLimits(section, key, val, explicit_command_list, pre_command_list, post_command_list, ini_namespace);
+
+	if (!wcscmp(key, L"wrap_draws"))
+		return ParseWrapDraws(section, key, val, explicit_command_list, pre_command_list, post_command_list, ini_namespace);
 
 	if (!wcscmp(key, L"clear"))
 		return ParseClearView(section, key, val, explicit_command_list, pre_command_list, post_command_list, ini_namespace);
@@ -2365,6 +2395,24 @@ void AbortCommand::run(CommandListState *state)
 	COMMAND_LIST_LOG(state, "[%S] handling = abort\n", ini_section.c_str());
 
 	state->aborted = true;
+}
+
+void WrapDrawsCommand::run(CommandListState *state)
+{
+	static bool reported;
+
+	COMMAND_LIST_LOG(state, "%S\n", ini_line.c_str());
+
+	if (!dx12_shim) {
+		// A D3D11 context makes the draws it is given: a [ShaderRegex]
+		// section can change what they do there instead
+		if (!reported) {
+			reported = true;
+			LogInfo("%S: wrap_draws only does something for D3D12 games. Ignored.\n", ini_line.c_str());
+		}
+		return;
+	}
+	Dx12ScopeWrapDraws(section ? &section->command_list : NULL, section ? &section->post_command_list : NULL);
 }
 
 FrameAnalysisChangeOptionsCommand::FrameAnalysisChangeOptionsCommand(wstring *val)
@@ -3484,6 +3532,43 @@ struct saved_shader_inst
 	}
 };
 
+// A mask of what of a description a [CustomShader] section has for a draw in a
+// draw of a D3D12 game, by its *_override: none of it (0), all of it (1, as it
+// replaces what is set on a D3D11 context) or what it names (2, merged)
+static void custom_states_mask(int override_mode, const void *merge_mask, void *mask, size_t size)
+{
+	if (override_mode == 2)
+		memcpy(mask, merge_mask, size);
+	else
+		memset(mask, override_mode ? 0 : 0xff, size);
+}
+
+static void custom_shader_dx12_states(const CustomShader *shader, Dx12CustomStates *states)
+{
+	int i;
+
+	memset(states, 0, sizeof(*states));
+
+	memcpy(&states->blend, &shader->blend_desc, sizeof(states->blend));
+	custom_states_mask(shader->blend_override, &shader->blend_mask, &states->blend_mask, sizeof(states->blend_mask));
+	states->sample_mask = shader->blend_sample_mask;
+	custom_states_mask(shader->blend_override, &shader->blend_sample_mask_merge_mask, &states->sample_mask_mask, sizeof(states->sample_mask_mask));
+	for (i = 0; i < 4; i++) {
+		states->blend_factor[i] = shader->blend_factor[i];
+		states->blend_factor_game[i] = !shader->blend_override || shader->blend_override == 2 && shader->blend_factor_merge_mask[i] != 0;
+	}
+
+	memcpy(&states->depth_stencil, &shader->depth_stencil_desc, sizeof(states->depth_stencil));
+	custom_states_mask(shader->depth_stencil_override, &shader->depth_stencil_mask, &states->depth_stencil_mask, sizeof(states->depth_stencil_mask));
+	states->stencil_ref = shader->stencil_ref;
+	custom_states_mask(shader->depth_stencil_override, &shader->stencil_ref_mask, &states->stencil_ref_mask, sizeof(states->stencil_ref_mask));
+
+	memcpy(&states->rasterizer, &shader->rs_desc, sizeof(states->rasterizer));
+	custom_states_mask(shader->rs_override, &shader->rs_mask, &states->rasterizer_mask, sizeof(states->rasterizer_mask));
+
+	Dx12CustomStatesKey(states);
+}
+
 void RunCustomShaderCommand::run(CommandListState *state)
 {
 	Profiling::Spike::SelfTime self_time(Profiling::Spike::CL_CUSTOM_SHADER);
@@ -3601,6 +3686,18 @@ void RunCustomShaderCommand::run(CommandListState *state)
 	// Likewise, save off all RTVs, UAVs and DSVs unconditionally:
 	save_om_state(state->mOrigContext1, &om_state);
 
+	// A draw in a draw of a D3D12 game is made with the game's pipeline
+	// state and none of the above: what the section sets of it goes in there
+	// instead, for the draws its command lists make (Dx12PipelineVariant)
+	Dx12CustomStates dx12_states;
+	const Dx12CustomStates *saved_dx12_states = NULL;
+	bool dx12_states_set = dx12_shim && Dx12InDrawScope()
+		&& (custom_shader->blend_override || custom_shader->depth_stencil_override || custom_shader->rs_override);
+	if (dx12_states_set) {
+		custom_shader_dx12_states(custom_shader, &dx12_states);
+		saved_dx12_states = Dx12ScopeSetCustomStates(&dx12_states);
+	}
+
 	// Run the command lists. This should generally include a draw or
 	// dispatch call, or call out to another command list which does.
 	// The reason for having a post command list is so that people can
@@ -3610,6 +3707,9 @@ void RunCustomShaderCommand::run(CommandListState *state)
 	_RunCommandList(&custom_shader->command_list, state);
 	state->post = true;
 	_RunCommandList(&custom_shader->post_command_list, state);
+
+	if (dx12_states_set)
+		Dx12ScopeSetCustomStates(saved_dx12_states);
 
 	for (int i = 0; i < 6; i++)
 		state->mHackerContext->mCustomShaderSrvSlots[i] = saved_srv_slots[i];

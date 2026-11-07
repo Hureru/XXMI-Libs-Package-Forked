@@ -4650,6 +4650,12 @@ static void ParseCustomShaderSections()
 		ParseTopology(custom_shader, shader_id->c_str());
 		ParseSamplerState(custom_shader, shader_id->c_str());
 
+		// And so does drawing with the fixed-function state they set, in a
+		// draw of the game (Dx12CustomStates)
+		if (wcsncmp(shader_id->c_str(), L"builtincustomshader", 19)
+		    && (custom_shader->blend_override || custom_shader->depth_stencil_override || custom_shader->rs_override))
+			dx12_keep_shader_bytecode = true;
+
 		custom_shader->max_executions_per_frame =
 			GetIniInt(shader_id->c_str(), L"max_executions_per_frame", 0, NULL);
 

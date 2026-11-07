@@ -60,6 +60,10 @@ static struct {
 	// Of those made with them, how many with the game's root signature
 	// extended for registers it has nothing for
 	unsigned custom_extended;
+	// Draws of mods with the fixed-function state of a [CustomShader] in
+	// the game's pipeline state, and with the game's for want of a pipeline
+	// with it; draws made by what wrap_draws set in their place
+	unsigned state_draws, state_failed, wrapped_draws;
 	// Only counted with dx12_dump_hashes, in QueryPerformanceCounter ticks
 	UINT64 wait_ticks, before_ticks, buffer_ticks, draw_ticks, after_ticks;
 } stats;
@@ -1801,9 +1805,29 @@ struct Dx12DrawScope {
 	// How many descriptors each of those copies has: as many as the shaders
 	// of the draw it was made for read, see grow_side_tables
 	UINT side_size[DX12_MAX_ROOT_ARGUMENTS];
+
+	// What wrap_draws set to run in place of the draws of the scope, and
+	// whether it is running for one, which may be the game's own
+	CommandList *wrap_pre, *wrap_post;
+	bool wrapping, wrapping_game_draw;
+	// The stencil ref and blend factor of the list were set for a draw of a
+	// mod from what a [CustomShader] section sets, see apply_custom_states
+	bool stencil_ref_changed, blend_factor_changed;
 };
 
 static Dx12DrawScope *scope;
+
+// What the [CustomShader] section running sets of the fixed-function state,
+// see Dx12ScopeSetCustomStates. Only while it runs, with the lock held.
+static const Dx12CustomStates *custom_states;
+
+const Dx12CustomStates* Dx12ScopeSetCustomStates(const Dx12CustomStates *states)
+{
+	const Dx12CustomStates *previous = custom_states;
+
+	custom_states = states;
+	return previous;
+}
 
 static const Dx12ListBufferWrites* scope_writes()
 {
@@ -2361,6 +2385,12 @@ static void restore_overrides()
 	if (scope->topology_changed)
 		list->IASetPrimitiveTopology(game->topology);
 	scope->topology_changed = false;
+	if (scope->stencil_ref_changed)
+		list->OMSetStencilRef(game->stencil_ref);
+	scope->stencil_ref_changed = false;
+	if (scope->blend_factor_changed)
+		list->OMSetBlendFactor(game->blend_factor);
+	scope->blend_factor_changed = false;
 }
 
 // Sets the game's heaps on the list again in place of the side heap. With
@@ -4765,6 +4795,10 @@ static void apply_pipeline(const ShimState *mod, bool mod_draw, bool extend)
 			wanted.shaders[stage] = &scope->mod_shaders[stage];
 			stages |= 1u << stage;
 		}
+		// What the [CustomShader] section that makes the draw sets of the
+		// fixed-function state, which goes into the game's
+		if (custom_states && custom_states->key)
+			wanted.states = custom_states;
 	}
 	// A pixel shader of a mod reads what the stage before it wrote in the
 	// D3D11 game, which the D3D12 game's may not all write
@@ -4797,7 +4831,7 @@ static void apply_pipeline(const ShimState *mod, bool mod_draw, bool extend)
 	if (extension)
 		wanted.root_signature = extension->signature;
 
-	if (wanted.elements || stages || wanted.removed_stages)
+	if (wanted.elements || stages || wanted.removed_stages || wanted.states)
 		variant = Dx12PipelineVariant(scope->pipeline, dx12_shim->device, &wanted, &why);
 	if (variant && extension)
 		scope->extension = *extension;
@@ -4820,6 +4854,12 @@ static void apply_pipeline(const ShimState *mod, bool mod_draw, bool extend)
 		if (G->dx12_dump_hashes)
 			note_custom_shader_failure(stages, why);
 	}
+	if (wanted.states && variant) {
+		stats.state_draws++;
+	} else if (wanted.states) {
+		stats.state_failed++;
+		scope->custom_failed = true;
+	}
 
 	if (G->dx12_dump_hashes && mod->input_layout && mod->input_layout != scope->game_layout)
 		note_input_layout(static_cast<const ShimInputLayout*>(mod->input_layout), variant);
@@ -4830,6 +4870,33 @@ static void apply_pipeline(const ShimState *mod, bool mod_draw, bool extend)
 	if (variant)
 		Dx12ShimPin(scope->list, variant);
 	scope->variant = variant;
+}
+
+// The stencil ref and blend factor a [CustomShader] section sets, for a draw
+// of a mod: those are set on the list rather than in the pipeline state, and
+// restore_overrides sets the game's again
+static void apply_custom_states()
+{
+	const Dx12CmdState *game = &scope->list->mState;
+	ID3D12GraphicsCommandList *list = scope->list->mOrig;
+	FLOAT factor[4];
+	bool factor_set = false;
+	UINT i;
+
+	if (!custom_states || scope->compute || scope->skin)
+		return;
+	if (custom_states->stencil_ref_mask != ~0u) {
+		list->OMSetStencilRef(game->stencil_ref & custom_states->stencil_ref_mask | custom_states->stencil_ref & ~custom_states->stencil_ref_mask);
+		scope->stencil_ref_changed = true;
+	}
+	for (i = 0; i < 4; i++) {
+		factor[i] = custom_states->blend_factor_game[i] ? game->blend_factor[i] : custom_states->blend_factor[i];
+		factor_set |= !custom_states->blend_factor_game[i];
+	}
+	if (factor_set) {
+		list->OMSetBlendFactor(factor);
+		scope->blend_factor_changed = true;
+	}
 }
 
 // Makes the next draw or dispatch on the list use what the mod has bound in
@@ -4882,6 +4949,8 @@ static void apply_overrides(bool mod_draw)
 		if (scope->extension.signature && scope->extension.parameters[stage] >= 0)
 			list->SetGraphicsRootDescriptorTable(scope->extension.parameters[stage], extra_tables[stage]);
 	}
+	if (mod_draw)
+		apply_custom_states();
 
 	for (i = 0; i < stage_count; i++) {
 		const ShimStageState *bound = &mod->stages[stages[i]];
@@ -4975,8 +5044,8 @@ static void apply_overrides(bool mod_draw)
 	}
 
 	// Only for a mod's own draws: the game's own are of its mesh, which
-	// goes with what the game wrote
-	for (mask = mod_draw && dx12_standins_live ? scope->pipeline->vb_slots & ~scope->vbs_changed : 0; _BitScanForward(&bit, mask); mask &= mask - 1) {
+	// goes with what the game wrote. So are those wrap_draws makes of one.
+	for (mask = mod_draw && !scope->wrapping_game_draw && dx12_standins_live ? scope->pipeline->vb_slots & ~scope->vbs_changed : 0; _BitScanForward(&bit, mask); mask &= mask - 1) {
 		D3D11_BUFFER_DESC written_desc;
 		Published *written;
 		UINT64 offset;
@@ -5114,6 +5183,45 @@ static void note_mod_draw(bool indexed, UINT count, UINT start)
 	Dx12DumpNote("%s\n", text);
 }
 
+void Dx12ScopeWrapDraws(CommandList *pre, CommandList *post)
+{
+	if (!scope || scope->compute || scope->skin) {
+		// A draw of a Vulkan game has none of this yet, and a dispatch
+		// makes no draws to wrap
+		if (pre || post)
+			Dx12ScopeUnsupported(!scope && VkInDrawScope() ? "wrap_draws in a draw of a Vulkan game"
+				: scope ? "wrap_draws in a dispatch" : "wrap_draws outside of a draw of the game");
+		return;
+	}
+	scope->wrap_pre = pre;
+	scope->wrap_post = post;
+}
+
+// Runs what wrap_draws set in place of a draw: of the game's own (game_draw)
+// or of a mod. The draw = from_caller of those makes the draw, and everything
+// else they draw is drawn as it comes. False if nothing was run in its place.
+static bool wrap_draw(bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance, bool game_draw)
+{
+	if ((!scope->wrap_pre && !scope->wrap_post) || scope->wrapping)
+		return false;
+
+	// As HackerContext has it for the draw it runs the command lists of
+	DrawCallInfo info = indexed
+		? DrawCallInfo(DrawCall::DrawIndexedInstanced, 0, count, instances, (UINT)base_vertex, start, start_instance, NULL, 0)
+		: DrawCallInfo(DrawCall::DrawInstanced, count, 0, instances, start, 0, start_instance, NULL, 0);
+
+	scope->wrapping = true;
+	scope->wrapping_game_draw = game_draw;
+	if (scope->wrap_pre)
+		RunCommandList(dx12_shim->hacker_device, dx12_shim->hacker_context, scope->wrap_pre, &info, false);
+	if (scope->wrap_post)
+		RunCommandList(dx12_shim->hacker_device, dx12_shim->hacker_context, scope->wrap_post, &info, true);
+	scope->wrapping = false;
+	scope->wrapping_game_draw = false;
+	stats.wrapped_draws++;
+	return true;
+}
+
 void Dx12ScopeDraw(bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance)
 {
 	const ShimState *mod = dx12_shim->shim_context->mState;
@@ -5141,6 +5249,9 @@ void Dx12ScopeDraw(bool indexed, UINT count, UINT instances, UINT start, INT bas
 	// nothing. The game's is still bound to its list here and would draw
 	// the game's mesh.
 	if (indexed && mod->ib_unbound)
+		return;
+
+	if (wrap_draw(indexed, count, instances, start, base_vertex, start_instance, false))
 		return;
 
 	apply_overrides(true);
@@ -5200,6 +5311,12 @@ static void open_scope(Dx12DrawScope *opened, Dx12GraphicsCommandList *list, con
 	opened->parameters.clear();
 	opened->side_impossible = false;
 	opened->heaps_changed = false;
+	opened->wrap_pre = NULL;
+	opened->wrap_post = NULL;
+	opened->wrapping = false;
+	opened->wrapping_game_draw = false;
+	opened->stencil_ref_changed = false;
+	opened->blend_factor_changed = false;
 
 	Dx12OpenForeignScope();
 	scope = opened;
@@ -6134,6 +6251,9 @@ bool Dx12Draw(Dx12GraphicsCommandList *list, bool indexed, UINT count, UINT inst
 	// The D3D12 command list still has the game's index buffer bound.
 	bool skip_draw = c.call_info.skip || (indexed && dx12_shim->shim_context->mState->ib_unbound);
 	stats.skipped += skip_draw;
+	// What a mod set with wrap_draws makes the draw in its place
+	if (!skip_draw && wrap_draw(indexed, count, instances, start, base_vertex, start_instance, true))
+		skip_draw = true;
 	if (!skip_draw) {
 		Profiling::Spike::Scope spike_apply(Profiling::Spike::DX12_APPLY);
 		apply_overrides(false);
@@ -6511,6 +6631,10 @@ void Dx12DrawPathFramePresented()
 			dx12_standins_live, stats.written_swapped);
 		Dx12DumpNote("  Mod draws with shaders of their own: %u made with them, %u of those with the game's root signature extended for them, %u with the game's for want of a pipeline with them\n",
 			stats.custom_draws, stats.custom_extended, stats.custom_failed);
+		if (stats.state_draws || stats.state_failed || stats.wrapped_draws)
+			Dx12DumpNote("  Mod draws with the fixed-function state of a [CustomShader]: %u made with it, %u with the game's for want of a pipeline with it; "
+				"%u draws were made by what wrap_draws set in their place\n",
+				stats.state_draws, stats.state_failed, stats.wrapped_draws);
 		if (stats.republished) {
 			Dx12DumpNote("  Buffers a mod matches were worked out again %u times, %u of them without a line for being too many\n",
 				stats.republished, stats.republished_unnoted);

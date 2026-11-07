@@ -46,3 +46,35 @@ cache_resource_data = constant_buffer
 The cache only holds what the CPU wrote. A buffer the GPU produced, such as the output of a custom compute shader, still takes the readback path above, and so does any buffer of a type that is not cached.
 
 See [GPU Readback](../examples/gpu-readback.md) for practical usage patterns.
+
+## `wrap_draws`
+
+Direct3D 12 only. For the rest of the draw of the game it runs in, every draw made there (the game's own, unless `handling = skip` said otherwise, and every `draw`/`drawindexed` of a mod) is made by running the given command list in its place. In that list `draw = from_caller` makes the draw it stands in for, with its own count, start and base vertex; whatever else it draws is drawn as it comes and is not wrapped again.
+
+```ini
+[TextureOverrideBody]
+hash = 12345678
+match_first_index = 0
+wrap_draws = CommandListTwoPasses
+
+[CommandListTwoPasses]
+run = CustomShaderDepthPrepass
+run = CustomShaderEqualDepth
+```
+
+`wrap_draws = null` makes the draws that follow as they come again. The setting ends with the draw of the game it was made in. It is what a [ShaderRegex] section that rewrites the game's shader does under D3D11, where the shaders of a D3D12 game cannot be rewritten: making several passes of every draw of a mesh, whoever draws it. It is ignored for D3D11 and Vulkan games and in dispatches, with a note in the dump of `dx12_dump_hashes = 1`, whose report also counts the wrapped draws.
+
+### Fixed-function state of `[CustomShader]` sections
+
+A draw a mod makes in a draw of a D3D12 game is made with the game's pipeline state made again with the mod's shaders. The blend, depth and stencil and rasterizer state a `[CustomShader]` section sets go into that state for the draws of its command lists: in full, as they would replace what is set on a D3D11 context, or with `blend_state_merge = 1`, `depth_stencil_state_merge = 1` and `rasterizer_state_merge = 1` only what the section names, the rest staying as the game has it. `stencil_ref` and `blend_factor[N]` are set on the command list for those draws.
+
+```ini
+[CustomShaderEqualDepth]
+; the game's shaders, drawn only where the depth is what an earlier pass left
+depth_func = equal
+depth_write_mask = zero
+depth_stencil_state_merge = 1
+draw = from_caller
+```
+
+A `mask[N] = 0x...` alone changes only which channels are written: a target the game does not blend stays unblended, and one it blends keeps its blending. Where D3D12 refuses the pipeline, the draw is made with the game's state and shaders, and the dump says why.

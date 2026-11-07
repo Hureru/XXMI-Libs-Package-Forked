@@ -483,6 +483,23 @@ public:
 	void run(CommandListState*) override;
 };
 
+// wrap_draws = CommandListFoo: for the rest of the draw of a D3D12 game this
+// runs for, every draw made in it (the game's own and those of mods) is made by
+// running CommandListFoo in its place, whose draw = from_caller makes that
+// draw. The draws CommandListFoo makes are made as they come. wrap_draws = null
+// takes it back. See Dx12ScopeWrapDraws.
+class WrapDrawsCommand : public CommandListCommand {
+public:
+	// NULL for null
+	ExplicitCommandListSection *section;
+
+	WrapDrawsCommand() :
+		section(NULL)
+	{}
+
+	void run(CommandListState*) override;
+};
+
 
 enum class CustomResourceType {
 	INVALID,
