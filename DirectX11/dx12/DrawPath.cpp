@@ -6452,6 +6452,26 @@ void Dx12DumpMarkedShader(UINT64 hash, const char *type)
 		CopyBytecodeToFixes(hash, type, shader->bytecode, shader->size);
 }
 
+// [Hunting] dx12_dump_shaders: each shader listed is written once, as the
+// marking key of hunting does, when it has been seen with its bytecode kept
+// (hunting or dx12_keep_shader_bytecode)
+static void dump_listed_shaders()
+{
+	static std::unordered_set<UINT64> written;
+
+	for (UINT64 hash : G->dx12_dump_shaders) {
+		const Dx12ShaderInfo *shader;
+
+		if (written.count(hash))
+			continue;
+		shader = Dx12FindShader(hash);
+		if (!shader || !shader->bytecode)
+			continue;
+		Dx12DumpMarkedShader(hash, dx12_stage_names[shader->stage]);
+		written.insert(hash);
+	}
+}
+
 // The hashes in a form to copy from, which the overlay is not
 static void log_selected_shaders()
 {
@@ -6584,6 +6604,8 @@ void Dx12DrawPathFramePresented()
 
 	if (G->hunting == HUNTING_MODE_ENABLED)
 		log_selected_shaders();
+	if (!G->dx12_dump_shaders.empty() && !(dx12_frame % 300))
+		dump_listed_shaders();
 
 	link_shader_regex();
 	update_reaches();

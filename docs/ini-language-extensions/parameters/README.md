@@ -85,6 +85,8 @@ dx12_match_cb1_size = 64
 
 The values of a game's shaders are listed in `dx12_shaders.csv`, written with `dx12_dump_hashes = 1` in `[Hunting]`.
 
+To read a shader of a D3D12 game itself, list its hash in `[Hunting]`: `dx12_dump_shaders = 85006ab64ad99057 728a51e4224fc394`. Each is written once to the `override_directory` as `<hash>-<stage>.dxil`, as the game gave it, within 300 frames of being seen. That needs the bytecode kept, which `hunting` other than 0 does.
+
 ## `DLL_SAMPLER_SLOTS`
 
 Returns `1` when the DLL binds [sampler states](../resources/sampler-states.md) to `<stage>-s<slot>` slots for the running game, and `0` in Direct3D 12 and Vulkan games, where those lines are ignored.

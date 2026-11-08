@@ -518,6 +518,9 @@ struct Globals
 	ShaderHashType shader_hash_type;
 	bool extended_rendering;
 	bool dx12_dump_hashes;
+	// [Hunting] dx12_dump_shaders: shaders of a D3D12 game to write to the
+	// override_directory as the game gave them
+	std::vector<UINT64> dx12_dump_shaders;
 	bool dx12_debug_layer;
 	bool dx12_dred;
 	UINT dx12_stall_dump_seconds;

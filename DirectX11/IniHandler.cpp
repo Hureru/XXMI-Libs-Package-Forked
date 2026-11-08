@@ -5047,6 +5047,26 @@ void LoadConfigFile()
 	G->texture_hash_version = GetIniInt(L"Rendering", L"texture_hash", 0, NULL);
 	G->extended_rendering = GetIniBool(L"Rendering", L"extended_rendering", true, NULL);
 	G->dx12_dump_hashes = GetIniBool(L"Hunting", L"dx12_dump_hashes", false, NULL);
+	{
+		std::string list;
+		const char *pos;
+
+		G->dx12_dump_shaders.clear();
+		GetIniString(L"Hunting", L"dx12_dump_shaders", NULL, &list);
+		for (pos = list.c_str(); *pos; ) {
+			char *end;
+			UINT64 hash;
+
+			if (!isxdigit((unsigned char)*pos)) {
+				pos++;
+				continue;
+			}
+			hash = _strtoui64(pos, &end, 16);
+			G->dx12_dump_shaders.push_back(hash);
+			LogInfo("  dx12_dump_shaders: %016llx\n", hash);
+			pos = end;
+		}
+	}
 	G->vk_dump_hashes = GetIniBool(L"Hunting", L"vk_dump_hashes", false, NULL);
 	G->vk_buffers_first = GetIniBool(L"Rendering", L"vk_buffers_first", false, NULL);
 	G->vk_cache_patched_shaders = GetIniBool(L"Rendering", L"vk_cache_patched_shaders", true, NULL);
