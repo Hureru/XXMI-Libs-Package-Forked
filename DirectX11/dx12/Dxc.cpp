@@ -431,34 +431,31 @@ static bool parse_parameter(const std::string &text, Parameter *parameter)
 	return true;
 }
 
-// Rewrites the parameters of main so that each of fits is declared with that
-// many components, or not at all, and the name the body uses is made up from
-// what is declared with zeros for the rest
-static bool fit_source(std::string *source, const std::vector<Fit> &fits, std::string *why)
+// Finds the parameters of main: open and close are where its parentheses are,
+// body where the brace that starts its body is
+static bool main_parameters(const std::string &source, size_t *open_at, size_t *close_at, size_t *body_at,
+		std::vector<Parameter> *parameters, std::string *why)
 {
 	size_t main_pos = 0, open, close, body, depth, pos, start;
-	std::vector<Parameter> parameters;
-	std::vector<bool> done(fits.size());
-	std::string rebuilt, declarations;
-	bool first = true;
 
+	parameters->clear();
 	for (;;) {
-		main_pos = source->find("main", main_pos);
+		main_pos = source.find("main", main_pos);
 		if (main_pos == std::string::npos) {
 			*why = "its entry point main was not found";
 			return false;
 		}
-		if ((!main_pos || !(isalnum((unsigned char)(*source)[main_pos - 1]) || (*source)[main_pos - 1] == '_'))
-		    && source->find_first_not_of(" \t\r\n", main_pos + 4) != std::string::npos
-		    && (*source)[source->find_first_not_of(" \t\r\n", main_pos + 4)] == '(')
+		if ((!main_pos || !(isalnum((unsigned char)source[main_pos - 1]) || source[main_pos - 1] == '_'))
+		    && source.find_first_not_of(" \t\r\n", main_pos + 4) != std::string::npos
+		    && source[source.find_first_not_of(" \t\r\n", main_pos + 4)] == '(')
 			break;
 		main_pos += 4;
 	}
-	open = source->find('(', main_pos);
-	for (close = open + 1, depth = 1; close < source->size() && depth; close++) {
-		if ((*source)[close] == '(')
+	open = source.find('(', main_pos);
+	for (close = open + 1, depth = 1; close < source.size() && depth; close++) {
+		if (source[close] == '(')
 			depth++;
-		else if ((*source)[close] == ')')
+		else if (source[close] == ')')
 			depth--;
 	}
 	if (depth) {
@@ -466,14 +463,14 @@ static bool fit_source(std::string *source, const std::vector<Fit> &fits, std::s
 		return false;
 	}
 	close--;
-	body = source->find('{', close);
+	body = source.find('{', close);
 	if (body == std::string::npos) {
 		*why = "the body of main was not found";
 		return false;
 	}
 
 	for (pos = start = open + 1, depth = 0; pos <= close; pos++) {
-		char c = (*source)[pos];
+		char c = source[pos];
 
 		if (c == '(' || c == '<')
 			depth++;
@@ -482,12 +479,31 @@ static bool fit_source(std::string *source, const std::vector<Fit> &fits, std::s
 		else if ((c == ',' && !depth) || pos == close) {
 			Parameter parameter;
 
-			parse_parameter(trim(source->substr(start, pos - start)), &parameter);
+			parse_parameter(trim(source.substr(start, pos - start)), &parameter);
 			if (!parameter.text.empty())
-				parameters.push_back(parameter);
+				parameters->push_back(parameter);
 			start = pos + 1;
 		}
 	}
+	*open_at = open;
+	*close_at = close;
+	*body_at = body;
+	return true;
+}
+
+// Rewrites the parameters of main so that each of fits is declared with that
+// many components, or not at all, and the name the body uses is made up from
+// what is declared with zeros for the rest
+static bool fit_source(std::string *source, const std::vector<Fit> &fits, std::string *why)
+{
+	size_t open, close, body;
+	std::vector<Parameter> parameters;
+	std::vector<bool> done(fits.size());
+	std::string rebuilt, declarations;
+	bool first = true;
+
+	if (!main_parameters(*source, &open, &close, &body, &parameters, why))
+		return false;
 
 	rebuilt = source->substr(0, open + 1);
 	for (Parameter &parameter : parameters) {
@@ -534,6 +550,148 @@ static bool fit_source(std::string *source, const std::vector<Fit> &fits, std::s
 	return true;
 }
 
+static UINT component_count(UINT mask)
+{
+	UINT count = 0;
+
+	for (; mask; mask >>= 1)
+		count += mask & 1;
+	return count;
+}
+
+// x 0 to w 3, 4 for none
+static UINT first_component(UINT mask)
+{
+	UINT i;
+
+	for (i = 0; i < 4 && !(mask & 1u << i); i++)
+		;
+	return i;
+}
+
+// Rewrites the parameters of main to take what the stage before writes in the
+// order it writes it, up to the last of it the shader reads. D3D12 links the
+// two by register, and DXC packs a signature in the order it is declared in:
+// a shader of a mod that declares its inputs in an order of its own (one that
+// matches the vertex shaders of the game it was written for) does not find
+// them where a vertex shader that writes them in another order puts them.
+// What the shader does not read of that is declared under a name of its own;
+// what it reads that is not written, other than what the rasterizer makes, is
+// 0 as with fit_source.
+static bool lay_out_source(std::string *source, const std::vector<Dx12SignatureElement> &outputs, std::string *why)
+{
+	static const char *const swizzles[] = { "", "x", "xy", "xyz", "xyzw" };
+	size_t open, close, body, i, p;
+	std::vector<Parameter> parameters;
+	std::vector<bool> used;
+	std::string list, declarations;
+	int last = -1;
+
+	if (!main_parameters(*source, &open, &close, &body, &parameters, why))
+		return false;
+	used.assign(parameters.size(), false);
+
+	for (const Parameter &parameter : parameters) {
+		if (parameter.out)
+			continue;
+		if (parameter.semantic.empty() || !parameter.components || parameter.components > 4) {
+			*why = "an input of main is not a scalar or vector parameter with a semantic, which cannot be laid out";
+			return false;
+		}
+		for (i = 0; i < outputs.size(); i++) {
+			if (same_semantic(outputs[i].name, parameter.semantic.c_str()) && outputs[i].index == parameter.index && (int)i > last)
+				last = (int)i;
+		}
+	}
+
+	for (i = 0; (int)i <= last; i++) {
+		const Dx12SignatureElement &output = outputs[i];
+		UINT components = component_count(output.mask);
+		bool system = !_strnicmp(output.name, "SV_", 3);
+		std::string semantic = std::string(output.name) + (system && !output.index ? "" : std::to_string(output.index));
+		const char *type = output.component_type == 1 ? "uint" : output.component_type == 2 ? "int" : "float";
+		std::string text;
+
+		if (!components || components > 4) {
+			*why = "the stage before writes a semantic with no components or more than four";
+			return false;
+		}
+		for (p = 0; p < parameters.size(); p++) {
+			if (!used[p] && !parameters[p].out && same_semantic(parameters[p].semantic.c_str(), output.name)
+			    && parameters[p].index == output.index)
+				break;
+		}
+		if (p == parameters.size()) {
+			// Read by nothing, only there to take its place
+			text = std::string(!system && output.component_type != 3 ? "nointerpolation " : "") + type
+				+ (components > 1 ? std::to_string(components) : "") + " unread_" + std::to_string(i) + " : " + semantic;
+		} else {
+			const Parameter &parameter = parameters[p];
+			std::string declared = parameter.type + (parameter.components > 1 ? std::to_string(parameter.components) : "");
+
+			used[p] = true;
+			if (components == parameter.components) {
+				text = parameter.text;
+			} else {
+				text = parameter.modifiers + parameter.type + (components > 1 ? std::to_string(components) : "")
+					+ " " + parameter.name + "_laid_out : " + semantic;
+				if (components > parameter.components) {
+					declarations += "  " + declared + " " + parameter.name + " = " + parameter.name + "_laid_out."
+						+ swizzles[parameter.components] + ";\n";
+				} else {
+					declarations += "  " + declared + " " + parameter.name + " = " + declared + "(" + parameter.name + "_laid_out";
+					for (UINT c = components; c < parameter.components; c++)
+						declarations += ", 0";
+					declarations += ");\n";
+				}
+			}
+		}
+		list += (list.empty() ? "\n  " : ",\n  ") + text;
+	}
+	// Then what the rasterizer makes, and 0 for what is not written at all
+	for (p = 0; p < parameters.size(); p++) {
+		const Parameter &parameter = parameters[p];
+
+		if (used[p] || parameter.out)
+			continue;
+		if (!_strnicmp(parameter.semantic.c_str(), "SV_", 3) && !same_semantic(parameter.semantic.c_str(), "SV_InstanceID"))
+			list += (list.empty() ? "\n  " : ",\n  ") + parameter.text;
+		else
+			declarations += "  " + parameter.type + (parameter.components > 1 ? std::to_string(parameter.components) : "")
+				+ " " + parameter.name + " = 0;\n";
+	}
+	for (const Parameter &parameter : parameters) {
+		if (parameter.out)
+			list += (list.empty() ? "\n  " : ",\n  ") + parameter.text;
+	}
+
+	*source = source->substr(0, open + 1) + list + source->substr(close, body - close + 1) + "\n" + declarations + source->substr(body + 1);
+	return true;
+}
+
+// Whether each input of the shader is in the register and components the stage
+// before writes it to, as D3D12 links them. Lists those that are not in moved.
+static bool inputs_lined_up(const std::vector<Dx12SignatureElement> &inputs, const std::vector<Dx12SignatureElement> &outputs,
+		std::string *moved)
+{
+	bool lined_up = true;
+
+	for (const Dx12SignatureElement &input : inputs) {
+		for (const Dx12SignatureElement &output : outputs) {
+			if (!same_semantic(output.name, input.name) || output.index != input.index)
+				continue;
+			if (output.reg != input.reg || first_component(output.mask) != first_component(input.mask)) {
+				lined_up = false;
+				if (moved)
+					*moved += (moved->empty() ? "" : ", ") + std::string(input.name) + std::to_string(input.index)
+						+ " read from r" + std::to_string(input.reg) + " written to r" + std::to_string(output.reg);
+			}
+			break;
+		}
+	}
+	return lined_up;
+}
+
 struct Fitted {
 	int result;
 	std::string why;
@@ -553,7 +711,7 @@ int Dx12DxcFitPixelShader(const Dx12ShaderInfo *ps, const Dx12ShaderInfo *upstre
 	ID3DBlob *blob = NULL;
 	FILE *file = NULL;
 	long size;
-	bool known;
+	bool known, misplaced;
 
 	*fitted = NULL;
 	*why = NULL;
@@ -583,10 +741,15 @@ int Dx12DxcFitPixelShader(const Dx12ShaderInfo *ps, const Dx12ShaderInfo *upstre
 		entry->why = "the signatures of the shaders could not be read";
 		goto failed;
 	}
+	// The inputs are laid out again in the order the stage before writes
+	// them in, which gives each the components it writes as well
+	misplaced = !inputs_lined_up(inputs, outputs, &cut);
 	for (const Dx12SignatureElement &input : inputs) {
 		const Dx12SignatureElement *output = NULL;
 		Fit fit = { input.name, input.index, 0 };
 
+		if (misplaced)
+			break;
 		for (const Dx12SignatureElement &candidate : outputs) {
 			if (same_semantic(candidate.name, input.name) && candidate.index == input.index)
 				output = &candidate;
@@ -608,7 +771,7 @@ int Dx12DxcFitPixelShader(const Dx12ShaderInfo *ps, const Dx12ShaderInfo *upstre
 		fits.push_back(fit);
 		cut += (cut.empty() ? "" : ", ") + fit.name + std::to_string(fit.index) + " to " + std::to_string(fit.components);
 	}
-	if (fits.empty()) {
+	if (fits.empty() && !misplaced) {
 		entry->result = 0;
 		return 0;
 	}
@@ -632,26 +795,44 @@ int Dx12DxcFitPixelShader(const Dx12ShaderInfo *ps, const Dx12ShaderInfo *upstre
 	}
 	fclose(file);
 
-	if (!fit_source(&source, fits, &entry->why))
+	if (misplaced ? !lay_out_source(&source, outputs, &entry->why) : !fit_source(&source, fits, &entry->why))
 		goto failed;
 	for (const auto &macro : origin.macros)
 		macros.push_back({ macro.first.c_str(), macro.second.c_str() });
 	macros.push_back({ NULL, NULL });
 	if (!Dx12DxcCompile(source.data(), source.size(), origin.path.c_str(), origin.target.c_str(), macros.data(),
 			origin.compile_flags, &blob, &errors)) {
-		entry->why = "compiling it cut down failed: " + errors;
+		entry->why = (misplaced ? "compiling it laid out again failed: " : "compiling it cut down failed: ") + errors;
 		goto failed;
 	}
 
 	entry->bytecode.assign((const BYTE*)blob->GetBufferPointer(), (const BYTE*)blob->GetBufferPointer() + blob->GetBufferSize());
 	blob->Release();
+	if (misplaced) {
+		std::vector<Dx12SignatureElement> laid_out;
+
+		// DXC may have packed it otherwise than the stage before was, for
+		// one by interpolation modes the signature does not tell
+		if (!Dx12ReadSignature(entry->bytecode.data(), entry->bytecode.size(), false, &laid_out) || !inputs_lined_up(laid_out, outputs, NULL)) {
+			entry->why = "laid out again in the order the " + std::string(dx12_stage_names[upstream->stage])
+				+ " writes, its inputs are still not where that writes them. The "
+				+ dx12_stage_names[upstream->stage] + " writes " + Dx12DescribeSignature(upstream->bytecode, upstream->size, true)
+				+ "; the shader laid out reads " + Dx12DescribeSignature(entry->bytecode.data(), entry->bytecode.size(), false);
+			entry->bytecode.clear();
+			goto failed;
+		}
+	}
 	entry->info = *ps;
 	entry->info.hash = fnv_64_buf(entry->bytecode.data(), entry->bytecode.size());
 	entry->info.size = (UINT32)entry->bytecode.size();
 	entry->info.bytecode = entry->bytecode.data();
 	entry->result = 1;
-	Dx12DumpNote("A mod's pixel shader %016llx was compiled again as %016llx with its inputs cut down to what the game's %s %016llx writes: %s\n",
-		ps->hash, entry->info.hash, dx12_stage_names[upstream->stage], upstream->hash, cut.c_str());
+	if (misplaced)
+		Dx12DumpNote("A mod's pixel shader %016llx was compiled again as %016llx with its inputs laid out as the game's %s %016llx writes them: %s\n",
+			ps->hash, entry->info.hash, dx12_stage_names[upstream->stage], upstream->hash, cut.c_str());
+	else
+		Dx12DumpNote("A mod's pixel shader %016llx was compiled again as %016llx with its inputs cut down to what the game's %s %016llx writes: %s\n",
+			ps->hash, entry->info.hash, dx12_stage_names[upstream->stage], upstream->hash, cut.c_str());
 	*fitted = &entry->info;
 	return 1;
 

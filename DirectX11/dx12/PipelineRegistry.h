@@ -263,10 +263,14 @@ struct Dx12SignatureElement {
 	UINT read_write_mask;
 	UINT reg;
 	UINT system_value;
+	// D3D_REGISTER_COMPONENT_TYPE: 1 uint, 2 int, 3 float
+	UINT component_type;
 };
 // The input (ISGN/ISG1) or output (OSGN/OSG1) signature of DXBC or DXIL.
 // False if there is none that can be read.
 bool Dx12ReadSignature(const void *bytecode, size_t size, bool output, std::vector<Dx12SignatureElement> *elements);
+// The elements of a signature as text, "TEXCOORD0 r1.xy, ...", for the log
+std::string Dx12DescribeSignature(const void *bytecode, size_t size, bool output);
 // Whether any shader the game has made a graphics pipeline of so far is DXIL,
 // which a shader of a mod drawn with that pipeline has to be as well
 bool Dx12GameHasDxilShaders();

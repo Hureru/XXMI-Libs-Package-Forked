@@ -143,6 +143,7 @@ bool Dx12ReadSignature(const void *bytecode, size_t size, bool output, std::vect
 			return false;
 		strncpy_s(element.name, (const char*)part.data + offset, min(sizeof(element.name) - 1, part.size - offset));
 		if (!read32(part, base + 4, &element.index) || !read32(part, base + 8, &element.system_value)
+		    || !read32(part, base + 12, &element.component_type)
 		    || !read32(part, base + 16, &element.reg) || !read32(part, base + 20, &value))
 			return false;
 		element.mask = value & 0xff;
@@ -150,6 +151,27 @@ bool Dx12ReadSignature(const void *bytecode, size_t size, bool output, std::vect
 		elements->push_back(element);
 	}
 	return true;
+}
+
+std::string Dx12DescribeSignature(const void *bytecode, size_t size, bool output)
+{
+	std::vector<Dx12SignatureElement> elements;
+	std::string text;
+
+	if (!bytecode || !Dx12ReadSignature(bytecode, size, output, &elements))
+		return "(not readable)";
+	if (elements.empty())
+		return "nothing";
+	for (const Dx12SignatureElement &element : elements) {
+		char line[160];
+		const char *types[] = { "?", "uint", "int", "float" };
+
+		_snprintf_s(line, _TRUNCATE, "%s%s%u r%u.%s%s%s%s %s", text.empty() ? "" : ", ", element.name, element.index, element.reg,
+			element.mask & 1 ? "x" : "", element.mask & 2 ? "y" : "", element.mask & 4 ? "z" : "", element.mask & 8 ? "w" : "",
+			types[element.component_type < 4 ? element.component_type : 0]);
+		text += line;
+	}
+	return text;
 }
 
 static void mark_registers(UINT64 *mask, unsigned words, UINT32 first, UINT32 count)
@@ -1452,9 +1474,26 @@ ID3D12PipelineState* Dx12PipelineVariant(const Dx12PipelineInfo *info, ID3D12Dev
 				info->shaders[DX12_STAGE_PS] ? info->shaders[DX12_STAGE_PS]->hash : 0,
 				info->shaders[DX12_STAGE_PS] ? info->shaders[DX12_STAGE_PS]->targets : 0,
 				variant->shaders[DX12_STAGE_PS] ? "" : ", and the mod keeps it");
-		if (!failed && variant->shaders[DX12_STAGE_PS])
+		if (!failed && variant->shaders[DX12_STAGE_PS]) {
+			static const Dx12ShaderStage upstream_stages[] = { DX12_STAGE_GS, DX12_STAGE_DS, DX12_STAGE_VS };
+			const Dx12ShaderInfo *upstream = NULL;
+
 			Dx12DumpNote("    The mod's ps %016llx writes %u render targets\n",
 				variant->shaders[DX12_STAGE_PS]->hash, variant->shaders[DX12_STAGE_PS]->targets);
+			// What D3D12 links the inputs of the pixel shader with, by register
+			for (Dx12ShaderStage upstream_stage : upstream_stages) {
+				if (!(variant->removed_stages & 1u << upstream_stage) && shaders[upstream_stage]) {
+					upstream = shaders[upstream_stage];
+					break;
+				}
+			}
+			if (upstream)
+				Dx12DumpNote("    The %s %016llx writes %s\n    The mod's ps reads %s\n",
+					dx12_stage_names[upstream->stage], upstream->hash,
+					Dx12DescribeSignature(upstream->bytecode, upstream->size, true).c_str(),
+					Dx12DescribeSignature(variant->shaders[DX12_STAGE_PS]->bytecode,
+						variant->shaders[DX12_STAGE_PS]->size, false).c_str());
+		}
 	}
 	if (why_failed && !pipeline)
 		*why_failed = failed ? failed : "D3D12 refused it";
